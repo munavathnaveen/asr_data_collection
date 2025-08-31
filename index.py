@@ -8,15 +8,21 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from huggingface_hub import HfApi
+from fastapi.middleware.cors import CORSMiddleware
+import json
+from huggingface_hub import HfApi, CommitOperationAdd
 
 # --------------------
 # CONFIG
 # --------------------
+
 AUDIO_DIR = os.path.join(gettempdir(), "audio_chunks")  # cross‑platform temp dir
 DATASET_DIR = os.path.join(gettempdir(), "dataset")
 URLS_FILE = "urls.txt"
-HF_TOKEN = os.getenv("HF_TOKEN")
+HF_TOKEN = os.environ.get("HF_TOKEN")
 HF_REPO = "1219Naveen/Asr_data"
+KV_FILE = os.path.join(DATASET_DIR, "kv.jsonl")  # local working copy we keep in sync
+kv_lock = asyncio.Lock()  # to prevent concurrent writes to kv.jsonl
 
 os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(DATASET_DIR, exist_ok=True)
@@ -36,7 +42,7 @@ class TranscriptSubmission(BaseModel):
 # --------------------
 async def extract_audio_chunks(url: str):
     """Download ONE video/audio, convert to 16k mono WAV, split into 30s chunks, enqueue them.
-    This function does *not* look at other URLs and is only called on demand.
+    This function does not look at other URLs and is only called on demand.
     """
     import yt_dlp
     import subprocess
@@ -108,6 +114,26 @@ async def extract_audio_chunks(url: str):
                 "url": url,
                 "status": "pending",
             })
+from fastapi.responses import FileResponse
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/clip/{clip_id}")
+async def get_clip(clip_id: str):
+    """Return the actual audio file for playback."""
+    for root, _, files in os.walk(AUDIO_DIR):
+        for f in files:
+            if f.startswith(clip_id) and f.lower().endswith(".wav"):
+                return FileResponse(os.path.join(root, f), media_type="audio/wav")
+    return JSONResponse(status_code=404, content={"status": "error", "msg": "clip not found"})
 
 
 def get_next_youtube_link():
@@ -130,30 +156,22 @@ def get_next_youtube_link():
 # --------------------
 # FASTAPI APP
 # --------------------
-app = FastAPI()
-
 
 @app.get("/next-clip")
 async def next_clip():
-    """Provide the next chunk to the frontend.
-    Behavior:
-    - If queue has items: pop one and return it.
-    - If queue is empty: take exactly ONE URL from urls.txt, process it (download+chunk+enqueue), then pop one.
-    - If after processing there's still no chunk (e.g., failed download): return a clear status.
-    """
     async with queue_lock:
         if not queue:
             video_url = get_next_youtube_link()
         else:
             video_url = None
 
-    if video_url:  # process outside the lock
+    if video_url:
         try:
             await extract_audio_chunks(video_url)
         except Exception as e:
             return JSONResponse(status_code=500, content={
                 "status": "failed",
-                "reason": f"error while processing url: {str(e)}",
+                "reason": str(e),
             })
 
     async with queue_lock:
@@ -161,15 +179,20 @@ async def next_clip():
             return {"status": "no_more_links_or_no_chunks"}
         item = queue.popleft()
         item["status"] = "in_progress"
-        return {"clip_id": item["clip_id"], "file_path": item["path"]}
-
+        return {
+            "clip_id": item["clip_id"],
+            "download_url": f"http://localhost:8000/clip/{item['clip_id']}"
+        }
 
 @app.post("/submit")
 async def submit(submission: TranscriptSubmission):
-    """Accept transcript for a clip, upload to HF, then delete the clip file.
-    Also delete the batch directory if it becomes empty.
     """
-    # Locate the clip by filename (we embed clip_id in the filename)
+    Accept transcript for a clip, upload to HF as a key-value mapping:
+      - key:  audio/<clip_id>.wav  (the audio file path inside the repo)
+      - value: transcript string   (stored as a line in kv.jsonl)
+    Also cleans up local files after a successful commit.
+    """
+    # 1) Locate the clip by filename
     clip_path = None
     for root, _, files in os.walk(AUDIO_DIR):
         for f in files:
@@ -182,33 +205,56 @@ async def submit(submission: TranscriptSubmission):
     if not clip_path or not os.path.exists(clip_path):
         return JSONResponse(status_code=404, content={"status": "error", "msg": "clip not found"})
 
-    # Save transcript + audio under dataset folder (temporary packaging for upload)
-    clip_dir = os.path.join(DATASET_DIR, submission.clip_id)
-    os.makedirs(clip_dir, exist_ok=True)
-    shutil.copy(clip_path, os.path.join(clip_dir, "audio.wav"))
-    with open(os.path.join(clip_dir, "transcript.txt"), "w", encoding="utf-8") as f:
-        f.write(submission.transcript)
+    # 2) Decide final repo path for this audio file
+    repo_audio_path = f"audio/{submission.clip_id}.wav"
 
-    # Upload folder to Hugging Face synchronously in a thread pool
+    # 3) Stage a local copy of the audio to upload (kept outside the served queue dir)
+    #    Use a tiny staging dir to avoid name collisions and to clean easily.
+    stage_dir = os.path.join(DATASET_DIR, f"stage_{submission.clip_id}")
+    os.makedirs(stage_dir, exist_ok=True)
+    staged_audio_path = os.path.join(stage_dir, f"{submission.clip_id}.wav")
+    shutil.copy(clip_path, staged_audio_path)
+
+    # 4) Append/maintain the local kv.jsonl (append-only)
+    #    Each line: {"key": "audio/<clip_id>.wav", "value": "<transcript>"}
+    async with kv_lock:
+        os.makedirs(DATASET_DIR, exist_ok=True)
+        with open(KV_FILE, "a", encoding="utf-8") as kvf:
+            kvf.write(json.dumps({"key": repo_audio_path, "value": submission.transcript}, ensure_ascii=False))
+            kvf.write("\n")
+
+    # 5) Commit both files to HF in a single commit
+    operations = [
+        CommitOperationAdd(path_in_repo=repo_audio_path, path_or_fileobj=staged_audio_path),
+        CommitOperationAdd(path_in_repo="kv.jsonl", path_or_fileobj=KV_FILE),
+    ]
+
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(
-        None,
-        lambda: api.upload_folder(
-            folder_path=clip_dir,
-            repo_id=HF_REPO,
-            repo_type="dataset",
-        ),
-    )
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: api.create_commit(
+                repo_id=HF_REPO,
+                repo_type="dataset",
+                operations=operations,
+                commit_message=f"Add {repo_audio_path} and update kv.jsonl",
+            )
+        )
+    except Exception as e:
+        # Do not delete the clip if commit failed; keep it so the user can retry/requeue
+        # Also revert last appended line in local KV_FILE to avoid drift if needed
+        # (simple, safe approach: leave the line; next commit will upload the current KV_FILE again)
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        return JSONResponse(status_code=500, content={"status": "failed", "reason": str(e)})
 
-    # Cleanup local storage: remove dataset staging + the served chunk
-    shutil.rmtree(clip_dir, ignore_errors=True)
+    # 6) Cleanup local staging + served chunk; optionally delete empty batch dir
+    shutil.rmtree(stage_dir, ignore_errors=True)
 
     try:
         os.remove(clip_path)
     except OSError:
         pass
 
-    # If the chunk's batch directory is now empty, remove it too
     batch_dir = os.path.dirname(clip_path)
     try:
         if os.path.isdir(batch_dir) and not any(os.scandir(batch_dir)):
@@ -216,7 +262,13 @@ async def submit(submission: TranscriptSubmission):
     except OSError:
         pass
 
-    return {"status": "uploaded", "clip_id": submission.clip_id}
+    return {
+        "status": "uploaded",
+        "clip_id": submission.clip_id,
+        "key": repo_audio_path,
+        "value_preview": submission.transcript[:80] + ("…" if len(submission.transcript) > 80 else "")
+    }
+
 
 
 @app.post("/requeue/{clip_id}")

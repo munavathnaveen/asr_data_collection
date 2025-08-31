@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+gitpython
+huggingface-hub
+requests
+aiofiles
+python-multipart
