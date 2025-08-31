@@ -181,7 +181,7 @@ async def next_clip():
         item["status"] = "in_progress"
         return {
             "clip_id": item["clip_id"],
-            "download_url": f"http://localhost:8000/clip/{item['clip_id']}"
+            "download_url": f"https://asr-data-collection.onrender.com/clip/{item['clip_id']}"
         }
 
 @app.post("/submit")
